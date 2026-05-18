@@ -46,6 +46,8 @@ from dwave.optimization.symbols.flow import (
     Where,
 )
 from dwave.optimization.symbols.indexing import (
+    AdjacentGather,
+    AdjacentGatherSum,
     AdvancedIndexing,
     BasicIndexing,
     Permutation,
@@ -116,6 +118,8 @@ from dwave.optimization.symbols.unaryop import (
 __all__ = [
     "Absolute",
     "AccumulateZip",
+    "AdjacentGather",
+    "AdjacentGatherSum",
     "Add",
     "AdvancedIndexing",
     "All",

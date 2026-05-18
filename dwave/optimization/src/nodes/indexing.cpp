@@ -1956,4 +1956,555 @@ void PermutationNode::propagate(State& state) const {
 
 void PermutationNode::revert(State& state) const { data_ptr<IndexingNodeData>(state)->revert(); }
 
+// AdjacentGatherNode *********************************************************
+
+namespace {
+
+inline ssize_t adjacent_output_size(ssize_t seq_size, bool has_prepend) {
+    if (has_prepend) return seq_size;
+    return std::max<ssize_t>(seq_size - 1, 0);
+}
+
+inline ssize_t adjacent_offset(const ssize_t row_stride_elems,
+                               const Array::const_iterator& seq_vals,
+                               ssize_t t,
+                               bool has_prepend,
+                               ssize_t prepend) {
+    ssize_t row, col;
+    if (has_prepend) {
+        if (t == 0) {
+            row = prepend;
+            col = seq_vals[0];
+        } else {
+            row = seq_vals[t - 1];
+            col = seq_vals[t];
+        }
+    } else {
+        row = seq_vals[t];
+        col = seq_vals[t + 1];
+    }
+    return row * row_stride_elems + col;
+}
+
+}  // namespace
+
+// IndexingNodeData extended with a per-state dynamic shape buffer, so that
+// `shape(State&) const` does not have to mutate node-owned storage.
+struct AdjacentGatherNodeData : IndexingNodeData {
+    AdjacentGatherNodeData(std::vector<ssize_t>&& offsets, std::vector<double>&& values,
+                           bool is_dynamic)
+            : IndexingNodeData(std::move(offsets), std::move(values)) {
+        if (is_dynamic) {
+            dynamic_shape = std::make_unique<ssize_t[]>(1);
+            dynamic_shape[0] = static_cast<ssize_t>(data.size());
+        }
+    }
+
+    void update_dynamic_shape() {
+        if (dynamic_shape) dynamic_shape[0] = static_cast<ssize_t>(data.size());
+    }
+
+    // nullptr when the node has a fixed (static) shape.
+    std::unique_ptr<ssize_t[]> dynamic_shape = nullptr;
+};
+
+AdjacentGatherNode::AdjacentGatherNode(ArrayNode* matrix_ptr, ArrayNode* sequence_ptr,
+                                       bool has_prepend, ssize_t prepend)
+        : matrix_ptr_(matrix_ptr),
+          sequence_ptr_(sequence_ptr),
+          has_prepend_(has_prepend),
+          prepend_(prepend),
+          shape_(std::make_unique<ssize_t[]>(1)),
+          strides_(std::make_unique<ssize_t[]>(1)),
+          size_(sequence_ptr && sequence_ptr->dynamic()
+                        ? Array::DYNAMIC_SIZE
+                        : adjacent_output_size(sequence_ptr ? sequence_ptr->size() : 0,
+                                               has_prepend)),
+          values_info_(matrix_ptr) {
+    if (matrix_ptr == nullptr) {
+        throw std::invalid_argument("matrix must not be null");
+    }
+    if (sequence_ptr == nullptr) {
+        throw std::invalid_argument("sequence must not be null");
+    }
+    if (!dynamic_cast<ConstantNode*>(matrix_ptr)) {
+        throw std::invalid_argument("matrix must be a ConstantNode");
+    }
+    if (matrix_ptr_->ndim() != 2) {
+        throw std::invalid_argument("matrix must be 2-dimensional");
+    }
+    const auto matrix_shape = matrix_ptr_->shape();
+    const ssize_t n_rows = matrix_shape[0];
+    const ssize_t n_cols = matrix_shape[1];
+
+    if (!sequence_ptr_->integral()) {
+        throw std::invalid_argument("sequence must take integral values");
+    }
+    if (sequence_ptr_->ndim() != 1) {
+        throw std::invalid_argument("sequence must be a 1d array");
+    }
+    if (sequence_ptr_->min() < 0) {
+        throw std::invalid_argument(
+                "sequence values must be >= 0 (negative indexing not supported)");
+    }
+    // Sequence values index both axes, so they must fit in min(n_rows, n_cols).
+    const double seq_max = sequence_ptr_->max();
+    if (seq_max >= n_rows) {
+        throw std::invalid_argument(
+                "sequence may have values out of range for the matrix's first dimension");
+    }
+    if (seq_max >= n_cols) {
+        throw std::invalid_argument(
+                "sequence may have values out of range for the matrix's second dimension");
+    }
+
+    // --- prepend validation: prepend is used as a *row* index only ---
+    if (has_prepend_) {
+        if (prepend_ < 0 || prepend_ >= n_rows) {
+            throw std::invalid_argument(
+                    "prepend value is out of range for the matrix's first dimension");
+        }
+    }
+
+    shape_[0] = (size_ == Array::DYNAMIC_SIZE)
+                        ? Array::DYNAMIC_SIZE
+                        : adjacent_output_size(sequence_ptr_->size(), has_prepend_);
+    strides_[0] = static_cast<ssize_t>(sizeof(double));
+
+    add_predecessor(matrix_ptr);
+    add_predecessor(sequence_ptr);
+}
+
+AdjacentGatherNode::AdjacentGatherNode(ArrayNode* matrix_ptr, ArrayNode* sequence_ptr)
+        : AdjacentGatherNode(matrix_ptr, sequence_ptr, /*has_prepend=*/false, /*prepend=*/0) {}
+
+AdjacentGatherNode::AdjacentGatherNode(ArrayNode* matrix_ptr, ArrayNode* sequence_ptr,
+                                       ssize_t prepend)
+        : AdjacentGatherNode(matrix_ptr, sequence_ptr, /*has_prepend=*/true, prepend) {}
+
+double const* AdjacentGatherNode::buff(const State& state) const {
+    return data_ptr<AdjacentGatherNodeData>(state)->data.data();
+}
+
+std::span<const Update> AdjacentGatherNode::diff(const State& state) const {
+    return data_ptr<AdjacentGatherNodeData>(state)->diff;
+}
+
+bool AdjacentGatherNode::integral() const { return values_info_.integral; }
+double AdjacentGatherNode::min() const { return values_info_.min; }
+double AdjacentGatherNode::max() const { return values_info_.max; }
+
+ssize_t AdjacentGatherNode::size(const State& state) const {
+    if (size_ != Array::DYNAMIC_SIZE) return size_;
+    return static_cast<ssize_t>(data_ptr<AdjacentGatherNodeData>(state)->data.size());
+}
+
+std::span<const ssize_t> AdjacentGatherNode::shape(const State& state) const {
+    if (size_ != Array::DYNAMIC_SIZE) return shape();
+    auto ptr = data_ptr<AdjacentGatherNodeData>(state);
+    assert(ptr->dynamic_shape && "dynamic node should have a per-state shape buffer");
+    return std::span<const ssize_t>(ptr->dynamic_shape.get(), 1);
+}
+
+ssize_t AdjacentGatherNode::size_diff(const State& state) const {
+    if (size_ != Array::DYNAMIC_SIZE) return 0;
+    auto ptr = data_ptr<AdjacentGatherNodeData>(state);
+    return static_cast<ssize_t>(ptr->data.size()) - ptr->old_size;
+}
+
+SizeInfo AdjacentGatherNode::sizeinfo() const {
+    if (size_ != Array::DYNAMIC_SIZE) return SizeInfo(size_);
+    SizeInfo info(sequence_ptr_);
+    if (!has_prepend_) info.offset = fraction(-1);
+    info.min = 0;
+    return info.substitute(1);
+}
+
+void AdjacentGatherNode::initialize_state(State& state) const {
+    const ssize_t seq_size = sequence_ptr_->size(state);
+    const ssize_t out_size = adjacent_output_size(seq_size, has_prepend_);
+    const ssize_t row_stride_elems =
+            matrix_ptr_->strides()[0] / static_cast<ssize_t>(matrix_ptr_->itemsize());
+    const double* matrix_buf = matrix_ptr_->buff(state);
+
+    auto seq_begin = sequence_ptr_->begin(state);
+
+    std::vector<ssize_t> offsets;
+    offsets.reserve(out_size);
+    std::vector<double> values;
+    values.reserve(out_size);
+
+    for (ssize_t t = 0; t < out_size; ++t) {
+        const ssize_t off =
+                adjacent_offset(row_stride_elems, seq_begin, t, has_prepend_, prepend_);
+        offsets.emplace_back(off);
+        values.emplace_back(matrix_buf[off]);
+    }
+
+    emplace_data_ptr<AdjacentGatherNodeData>(state, std::move(offsets), std::move(values),
+                                             /*is_dynamic=*/size_ == Array::DYNAMIC_SIZE);
+}
+
+void AdjacentGatherNode::commit(State& state) const {
+    data_ptr<AdjacentGatherNodeData>(state)->commit();
+}
+
+void AdjacentGatherNode::revert(State& state) const {
+    auto ptr = data_ptr<AdjacentGatherNodeData>(state);
+    ptr->revert();
+    ptr->update_dynamic_shape();
+}
+
+void AdjacentGatherNode::propagate(State& state) const {
+    auto ptr = data_ptr<AdjacentGatherNodeData>(state);
+    auto& offsets = ptr->offsets;
+    auto& values = ptr->data;
+    auto& updates = ptr->diff;
+    auto& old_offsets = ptr->old_offsets;
+
+    assert(updates.size() == 0 && "called propagate on a node with pending updates");
+    assert(matrix_ptr_->diff(state).size() == 0 && "matrix is expected to be constant");
+
+    auto seq_diff = sequence_ptr_->diff(state);
+    if (seq_diff.empty()) return;
+
+    const ssize_t row_stride_elems =
+            matrix_ptr_->strides()[0] / static_cast<ssize_t>(matrix_ptr_->itemsize());
+    const double* matrix_buf = matrix_ptr_->buff(state);
+
+    // 1. Compute new and old output sizes.
+    const ssize_t old_out_size = static_cast<ssize_t>(offsets.size());
+    const ssize_t new_seq_size = sequence_ptr_->size(state);
+    const ssize_t new_out_size = adjacent_output_size(new_seq_size, has_prepend_);
+    const ssize_t overlap_size = std::min(old_out_size, new_out_size);
+
+    auto seq_begin = sequence_ptr_->begin(state);
+
+    // 2. Shrink: pop output positions [new_out_size, old_out_size) in reverse.
+    for (ssize_t t = old_out_size - 1; t >= new_out_size; --t) {
+        const double old_val = values.back();
+        const ssize_t old_off = offsets.back();
+        updates.emplace_back(Update::removal(t, old_val));
+        old_offsets.emplace_back(old_off);
+        values.pop_back();
+        offsets.pop_back();
+    }
+
+    // 3. Mutate: a change at seq[i] touches out[i-1] and out[i] without
+    //    prepend, or out[i] and out[i+1] with prepend. Collect the affected
+    //    overlap positions and recompute them. A bitmap is used when the diff
+    //    is dense; otherwise sort + unique is cheaper.
+    if (overlap_size > 0) {
+        const bool dense_diff =
+                static_cast<ssize_t>(seq_diff.size()) * 2 >= overlap_size;
+
+        if (dense_diff) {
+            std::vector<uint8_t> touched(overlap_size, 0);
+            for (const auto& upd : seq_diff) {
+                const ssize_t i = upd.index;
+                if (i >= new_seq_size) continue;
+                ssize_t a, b;
+                if (has_prepend_) {
+                    a = i;
+                    b = i + 1;
+                } else {
+                    a = i - 1;
+                    b = i;
+                }
+                if (a >= 0 && a < overlap_size) touched[a] = 1;
+                if (b >= 0 && b < overlap_size) touched[b] = 1;
+            }
+
+            for (ssize_t t = 0; t < overlap_size; ++t) {
+                if (!touched[t]) continue;
+                const ssize_t new_off =
+                        adjacent_offset(row_stride_elems, seq_begin, t, has_prepend_, prepend_);
+                if (new_off == offsets[t]) continue;
+
+                const ssize_t old_off = offsets[t];
+                const double old_val = values[t];
+                offsets[t] = new_off;
+                values[t] = matrix_buf[new_off];
+                updates.emplace_back(t, old_val, values[t]);
+                old_offsets.emplace_back(old_off);
+            }
+        } else {
+            std::vector<ssize_t> touched_indices;
+            touched_indices.reserve(seq_diff.size() * 2);
+            for (const auto& upd : seq_diff) {
+                const ssize_t i = upd.index;
+                if (i >= new_seq_size) continue;
+                ssize_t a, b;
+                if (has_prepend_) {
+                    a = i;
+                    b = i + 1;
+                } else {
+                    a = i - 1;
+                    b = i;
+                }
+                if (a >= 0 && a < overlap_size) touched_indices.push_back(a);
+                if (b >= 0 && b < overlap_size) touched_indices.push_back(b);
+            }
+            std::ranges::sort(touched_indices);
+            auto unique_end = std::ranges::unique(touched_indices).begin();
+            touched_indices.erase(unique_end, touched_indices.end());
+
+            for (const ssize_t t : touched_indices) {
+                const ssize_t new_off =
+                        adjacent_offset(row_stride_elems, seq_begin, t, has_prepend_, prepend_);
+                if (new_off == offsets[t]) continue;
+
+                const ssize_t old_off = offsets[t];
+                const double old_val = values[t];
+                offsets[t] = new_off;
+                values[t] = matrix_buf[new_off];
+                updates.emplace_back(t, old_val, values[t]);
+                old_offsets.emplace_back(old_off);
+            }
+        }
+    }
+
+    // 4. Grow: push new output positions [old_out_size, new_out_size).
+    for (ssize_t t = old_out_size; t < new_out_size; ++t) {
+        const ssize_t new_off =
+                adjacent_offset(row_stride_elems, seq_begin, t, has_prepend_, prepend_);
+        const double new_val = matrix_buf[new_off];
+        offsets.push_back(new_off);
+        values.push_back(new_val);
+        updates.emplace_back(Update::placement(t, new_val));
+        // Placeholder old offset; revert resizes down through it without reading.
+        old_offsets.emplace_back(0);
+    }
+
+    ptr->update_dynamic_shape();
+
+    if (!updates.empty()) Node::propagate(state);
+}
+
+// AdjacentGatherSumNode ******************************************************
+
+struct AdjacentGatherSumNodeData : NodeStateData {
+    AdjacentGatherSumNodeData(std::vector<ssize_t>&& offsets, double value) noexcept
+            : offsets(std::move(offsets)), update(0, value, value), old_size(this->offsets.size()) {}
+
+    void commit() {
+        update.old = update.value;
+        old_offsets.clear();
+        old_size = offsets.size();
+    }
+
+    void revert() {
+        if (old_size > static_cast<ssize_t>(offsets.size())) offsets.resize(old_size);
+
+        auto it = old_offsets.rbegin();
+        for (const auto& [index, _, __] : edge_diff | std::views::reverse) {
+            offsets[index] = *it;
+            ++it;
+        }
+
+        if (old_size < static_cast<ssize_t>(offsets.size())) offsets.resize(old_size);
+
+        update.value = update.old;
+        edge_diff.clear();
+        old_offsets.clear();
+    }
+
+    std::vector<ssize_t> offsets;
+    std::vector<Update> edge_diff;
+    std::vector<ssize_t> old_offsets;
+    Update update;
+    ssize_t old_size;
+};
+
+AdjacentGatherSumNode::AdjacentGatherSumNode(ArrayNode* matrix_ptr, ArrayNode* sequence_ptr,
+                                             bool has_prepend, ssize_t prepend)
+        : matrix_ptr_(matrix_ptr),
+          sequence_ptr_(sequence_ptr),
+          has_prepend_(has_prepend),
+          prepend_(prepend),
+          values_info_(matrix_ptr) {
+    if (matrix_ptr == nullptr) {
+        throw std::invalid_argument("matrix must not be null");
+    }
+    if (sequence_ptr == nullptr) {
+        throw std::invalid_argument("sequence must not be null");
+    }
+    if (!dynamic_cast<ConstantNode*>(matrix_ptr)) {
+        throw std::invalid_argument("matrix must be a ConstantNode");
+    }
+    if (matrix_ptr_->ndim() != 2) {
+        throw std::invalid_argument("matrix must be 2-dimensional");
+    }
+
+    const auto matrix_shape = matrix_ptr_->shape();
+    const ssize_t n_rows = matrix_shape[0];
+    const ssize_t n_cols = matrix_shape[1];
+
+    if (!sequence_ptr_->integral()) {
+        throw std::invalid_argument("sequence must take integral values");
+    }
+    if (sequence_ptr_->ndim() != 1) {
+        throw std::invalid_argument("sequence must be a 1d array");
+    }
+    if (sequence_ptr_->min() < 0) {
+        throw std::invalid_argument(
+                "sequence values must be >= 0 (negative indexing not supported)");
+    }
+
+    const double seq_max = sequence_ptr_->max();
+    if (seq_max >= n_rows) {
+        throw std::invalid_argument(
+                "sequence may have values out of range for the matrix's first dimension");
+    }
+    if (seq_max >= n_cols) {
+        throw std::invalid_argument(
+                "sequence may have values out of range for the matrix's second dimension");
+    }
+    if (has_prepend_ && (prepend_ < 0 || prepend_ >= n_rows)) {
+        throw std::invalid_argument(
+                "prepend value is out of range for the matrix's first dimension");
+    }
+
+    add_predecessor(matrix_ptr);
+    add_predecessor(sequence_ptr);
+}
+
+AdjacentGatherSumNode::AdjacentGatherSumNode(ArrayNode* matrix_ptr, ArrayNode* sequence_ptr)
+        : AdjacentGatherSumNode(matrix_ptr, sequence_ptr, false, 0) {}
+
+AdjacentGatherSumNode::AdjacentGatherSumNode(ArrayNode* matrix_ptr, ArrayNode* sequence_ptr,
+                                             ssize_t prepend)
+        : AdjacentGatherSumNode(matrix_ptr, sequence_ptr, true, prepend) {}
+
+bool AdjacentGatherSumNode::integral() const { return values_info_.integral; }
+
+double AdjacentGatherSumNode::min() const {
+    const auto sizeinfo = sequence_ptr_->sizeinfo();
+    const auto min_count = adjacent_output_size(sizeinfo.min.value_or(0), has_prepend_);
+    const auto max_count = adjacent_output_size(
+            sizeinfo.max.value_or(std::numeric_limits<ssize_t>::max()), has_prepend_);
+    return (values_info_.min < 0 ? max_count : min_count) * values_info_.min;
+}
+
+double AdjacentGatherSumNode::max() const {
+    const auto sizeinfo = sequence_ptr_->sizeinfo();
+    const auto min_count = adjacent_output_size(sizeinfo.min.value_or(0), has_prepend_);
+    const auto max_count = adjacent_output_size(
+            sizeinfo.max.value_or(std::numeric_limits<ssize_t>::max()), has_prepend_);
+    return (values_info_.max > 0 ? max_count : min_count) * values_info_.max;
+}
+
+void AdjacentGatherSumNode::initialize_state(State& state) const {
+    const ssize_t seq_size = sequence_ptr_->size(state);
+    const ssize_t out_size = adjacent_output_size(seq_size, has_prepend_);
+    const ssize_t row_stride_elems =
+            matrix_ptr_->strides()[0] / static_cast<ssize_t>(matrix_ptr_->itemsize());
+    const double* matrix_buf = matrix_ptr_->buff(state);
+    auto seq_begin = sequence_ptr_->begin(state);
+
+    std::vector<ssize_t> offsets;
+    offsets.reserve(out_size);
+    double total = 0.0;
+    for (ssize_t t = 0; t < out_size; ++t) {
+        const ssize_t off =
+                adjacent_offset(row_stride_elems, seq_begin, t, has_prepend_, prepend_);
+        offsets.push_back(off);
+        total += matrix_buf[off];
+    }
+    emplace_data_ptr<AdjacentGatherSumNodeData>(state, std::move(offsets), total);
+}
+
+double const* AdjacentGatherSumNode::buff(const State& state) const {
+    return &data_ptr<AdjacentGatherSumNodeData>(state)->update.value;
+}
+
+std::span<const Update> AdjacentGatherSumNode::diff(const State& state) const {
+    auto ptr = data_ptr<AdjacentGatherSumNodeData>(state);
+    return std::span(&ptr->update, ptr->update.old != ptr->update.value);
+}
+
+void AdjacentGatherSumNode::commit(State& state) const {
+    data_ptr<AdjacentGatherSumNodeData>(state)->commit();
+}
+
+void AdjacentGatherSumNode::revert(State& state) const {
+    data_ptr<AdjacentGatherSumNodeData>(state)->revert();
+}
+
+void AdjacentGatherSumNode::propagate(State& state) const {
+    auto ptr = data_ptr<AdjacentGatherSumNodeData>(state);
+    auto& offsets = ptr->offsets;
+    auto& edge_diff = ptr->edge_diff;
+    auto& old_offsets = ptr->old_offsets;
+
+    assert(edge_diff.empty() && "called propagate on a node with pending updates");
+
+    auto seq_diff = sequence_ptr_->diff(state);
+    if (seq_diff.empty()) return;
+
+    const ssize_t row_stride_elems =
+            matrix_ptr_->strides()[0] / static_cast<ssize_t>(matrix_ptr_->itemsize());
+    const double* matrix_buf = matrix_ptr_->buff(state);
+    const ssize_t new_seq_size = sequence_ptr_->size(state);
+    const ssize_t new_out_size = adjacent_output_size(new_seq_size, has_prepend_);
+    const ssize_t old_out_size = static_cast<ssize_t>(offsets.size());
+    const ssize_t overlap_size = std::min(old_out_size, new_out_size);
+    auto seq_begin = sequence_ptr_->begin(state);
+
+    double total = ptr->update.value;
+
+    for (ssize_t t = old_out_size - 1; t >= new_out_size; --t) {
+        const ssize_t old_off = offsets.back();
+        total -= matrix_buf[old_off];
+        edge_diff.emplace_back(Update::removal(t, matrix_buf[old_off]));
+        old_offsets.emplace_back(old_off);
+        offsets.pop_back();
+    }
+
+    std::vector<ssize_t> touched_indices;
+    touched_indices.reserve(seq_diff.size() * 2);
+    for (const auto& upd : seq_diff) {
+        const ssize_t i = upd.index;
+        if (i >= new_seq_size) continue;
+        ssize_t a, b;
+        if (has_prepend_) {
+            a = i;
+            b = i + 1;
+        } else {
+            a = i - 1;
+            b = i;
+        }
+        if (a >= 0 && a < overlap_size) touched_indices.push_back(a);
+        if (b >= 0 && b < overlap_size) touched_indices.push_back(b);
+    }
+    std::ranges::sort(touched_indices);
+    auto unique_end = std::ranges::unique(touched_indices).begin();
+    touched_indices.erase(unique_end, touched_indices.end());
+
+    for (const ssize_t t : touched_indices) {
+        const ssize_t new_off =
+                adjacent_offset(row_stride_elems, seq_begin, t, has_prepend_, prepend_);
+        const ssize_t old_off = offsets[t];
+        if (old_off == new_off) continue;
+        total += matrix_buf[new_off] - matrix_buf[old_off];
+        offsets[t] = new_off;
+        edge_diff.emplace_back(t, matrix_buf[old_off], matrix_buf[new_off]);
+        old_offsets.emplace_back(old_off);
+    }
+
+    if (new_out_size > old_out_size) {
+        for (ssize_t t = old_out_size; t < new_out_size; ++t) {
+            const ssize_t new_off =
+                    adjacent_offset(row_stride_elems, seq_begin, t, has_prepend_, prepend_);
+            total += matrix_buf[new_off];
+            offsets.push_back(new_off);
+            edge_diff.emplace_back(Update::placement(t, matrix_buf[new_off]));
+            old_offsets.emplace_back(0);
+        }
+    }
+
+    ptr->update.value = total;
+    if (ptr->update.old != ptr->update.value) Node::propagate(state);
+}
+
 }  // namespace dwave::optimization

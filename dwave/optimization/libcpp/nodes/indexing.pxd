@@ -33,3 +33,15 @@ cdef extern from "dwave-optimization/nodes/indexing.hpp" namespace "dwave::optim
 
     cdef cppclass PermutationNode(ArrayNode):
         pass
+
+    cdef cppclass AdjacentGatherNode(ArrayNode):
+        AdjacentGatherNode(ArrayNode*, ArrayNode*) except +
+        AdjacentGatherNode(ArrayNode*, ArrayNode*, Py_ssize_t) except +
+        bint has_prepend()
+        Py_ssize_t prepend()
+
+    cdef cppclass AdjacentGatherSumNode(ArrayNode):
+        AdjacentGatherSumNode(ArrayNode*, ArrayNode*) except +
+        AdjacentGatherSumNode(ArrayNode*, ArrayNode*, Py_ssize_t) except +
+        bint has_prepend()
+        Py_ssize_t prepend()

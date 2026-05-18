@@ -304,4 +304,104 @@ class PermutationNode : public ArrayOutputMixin<ArrayNode> {
     const ValuesInfo values_info_;
 };
 
+// AdjacentGatherNode *********************************************************
+//
+// Pairwise lookups along consecutive elements of a 1-D integer `sequence`
+// indexed into a 2-D `matrix`. Equivalent to NumPy's
+// ``matrix[seq[:-1], seq[1:]]`` when ``prepend`` is omitted, or to
+// ``[matrix[prepend, seq[0]], matrix[seq[0], seq[1]], ...]`` when it is given.
+//
+// `matrix` must be a 2-D `ConstantNode`. `sequence` must be 1-D and integral,
+// with values in range for both matrix axes; dynamic sequences are supported.
+// `prepend`, if given, must be in range for the matrix's first axis.
+class AdjacentGatherNode : public ArrayNode {
+ public:
+    // out[t] = matrix[seq[t], seq[t+1]]   for t in [0, seq.size() - 1)
+    AdjacentGatherNode(ArrayNode* matrix_ptr, ArrayNode* sequence_ptr);
+
+    // out[0] = matrix[prepend, seq[0]];
+    // out[t] = matrix[seq[t-1], seq[t]]   for t in [1, seq.size())
+    AdjacentGatherNode(ArrayNode* matrix_ptr, ArrayNode* sequence_ptr, ssize_t prepend);
+
+    // Array overloads
+    ssize_t ndim() const noexcept override { return 1; }
+    double const* buff(const State& state) const override;
+    std::span<const Update> diff(const State& state) const override;
+    ssize_t size() const override { return size_; }
+    ssize_t size(const State& state) const override;
+    std::span<const ssize_t> shape() const override { return std::span(shape_.get(), 1); }
+    std::span<const ssize_t> shape(const State& state) const override;
+    ssize_t size_diff(const State& state) const override;
+    SizeInfo sizeinfo() const override;
+    std::span<const ssize_t> strides() const override { return std::span(strides_.get(), 1); }
+    bool contiguous() const override { return true; }
+
+    /// @copydoc Array::integral()
+    bool integral() const override;
+    /// @copydoc Array::min()
+    double min() const override;
+    /// @copydoc Array::max()
+    double max() const override;
+
+    // Node overloads
+    void initialize_state(State& state) const override;
+    void commit(State& state) const override;
+    void revert(State& state) const override;
+    void propagate(State& state) const override;
+
+    // Node-specific accessors (used by the Cython binding for serialization).
+    bool has_prepend() const noexcept { return has_prepend_; }
+    ssize_t prepend() const noexcept { return prepend_; }
+
+ private:
+    AdjacentGatherNode(ArrayNode* matrix_ptr, ArrayNode* sequence_ptr,
+                       bool has_prepend, ssize_t prepend);
+
+    const Array* matrix_ptr_;
+    const Array* sequence_ptr_;
+
+    const bool has_prepend_;
+    const ssize_t prepend_;
+
+    std::unique_ptr<ssize_t[]> shape_;
+    std::unique_ptr<ssize_t[]> strides_;
+    const ssize_t size_;
+
+    const ValuesInfo values_info_;
+};
+
+// AdjacentGatherSumNode ******************************************************
+//
+// Scalar total of AdjacentGatherNode's edge vector, without materializing the
+// vector itself.
+class AdjacentGatherSumNode : public ScalarOutputMixin<ArrayNode, false> {
+ public:
+    AdjacentGatherSumNode(ArrayNode* matrix_ptr, ArrayNode* sequence_ptr);
+    AdjacentGatherSumNode(ArrayNode* matrix_ptr, ArrayNode* sequence_ptr, ssize_t prepend);
+
+    bool integral() const override;
+    double min() const override;
+    double max() const override;
+
+    double const* buff(const State& state) const override;
+    std::span<const Update> diff(const State& state) const override;
+    void initialize_state(State& state) const override;
+    void commit(State& state) const override;
+    void revert(State& state) const override;
+    void propagate(State& state) const override;
+
+    bool has_prepend() const noexcept { return has_prepend_; }
+    ssize_t prepend() const noexcept { return prepend_; }
+
+ private:
+    AdjacentGatherSumNode(ArrayNode* matrix_ptr, ArrayNode* sequence_ptr,
+                          bool has_prepend, ssize_t prepend);
+
+    const Array* matrix_ptr_;
+    const Array* sequence_ptr_;
+    const bool has_prepend_;
+    const ssize_t prepend_;
+    const ValuesInfo values_info_;
+};
+
 }  // namespace dwave::optimization

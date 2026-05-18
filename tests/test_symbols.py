@@ -142,6 +142,309 @@ class TestAccumulateZip(utils.SymbolTests):
             dwave.optimization.symbols.AccumulateZip(expr, (c0,))
 
 
+class TestAdjacentGather(utils.SymbolTests):
+    def generate_symbols(self):
+        model = Model()
+        M = model.constant(np.arange(16).reshape(4, 4).astype(float))
+        seq_a = model.list(4)
+        seq_b = model.list(4)
+        ag_no_prepend = dwave.optimization.symbols.AdjacentGather(M, seq_a)
+        ag_with_prepend = dwave.optimization.symbols.AdjacentGather(M, seq_b, prepend=0)
+        with model.lock():
+            yield ag_no_prepend
+            yield ag_with_prepend
+
+    def test_shape(self):
+        model = Model()
+        M = model.constant(np.arange(16).reshape(4, 4).astype(float))
+        seq = model.list(4)
+        self.assertEqual(
+            dwave.optimization.symbols.AdjacentGather(M, seq).shape(), (3,))
+        self.assertEqual(
+            dwave.optimization.symbols.AdjacentGather(M, seq, prepend=0).shape(), (4,))
+
+    def test_numpy_equivalence_no_prepend(self):
+        rng = np.random.default_rng(0)
+        M_arr = rng.integers(-100, 100, size=(6, 6)).astype(float)
+        model = Model()
+        M = model.constant(M_arr)
+        seq = model.list(6)
+        ag = dwave.optimization.symbols.AdjacentGather(M, seq)
+
+        with model.lock():
+            model.states.resize(1)
+            for perm in ([0, 1, 2, 3, 4, 5], [5, 0, 4, 1, 3, 2], [3, 2, 1, 0, 5, 4]):
+                seq.set_state(0, perm)
+                expected = M_arr[perm[:-1], perm[1:]]
+                np.testing.assert_array_equal(ag.state(0), expected)
+
+    def test_numpy_equivalence_with_prepend(self):
+        rng = np.random.default_rng(1)
+        M_arr = rng.integers(-100, 100, size=(5, 5)).astype(float)
+        model = Model()
+        M = model.constant(M_arr)
+        seq = model.list(5)
+        ag = dwave.optimization.symbols.AdjacentGather(M, seq, prepend=2)
+
+        with model.lock():
+            model.states.resize(1)
+            for perm in ([0, 1, 2, 3, 4], [4, 3, 2, 1, 0], [1, 4, 0, 3, 2]):
+                seq.set_state(0, perm)
+                full = [2] + list(perm)
+                expected = np.array([M_arr[full[t], full[t + 1]] for t in range(5)])
+                np.testing.assert_array_equal(ag.state(0), expected)
+
+    def test_propagation_under_state_changes(self):
+        # Verifies that incremental propagate/commit/revert produces the same
+        # values as a full recomputation after each move.
+        rng = np.random.default_rng(2)
+        M_arr = rng.integers(0, 50, size=(7, 7)).astype(float)
+        model = Model()
+        M = model.constant(M_arr)
+        seq = model.list(7)
+        ag_no = dwave.optimization.symbols.AdjacentGather(M, seq)
+        ag_pre = dwave.optimization.symbols.AdjacentGather(M, seq, prepend=3)
+
+        with model.lock():
+            model.states.resize(1)
+            perms = [
+                [0, 1, 2, 3, 4, 5, 6],
+                [6, 5, 4, 3, 2, 1, 0],
+                [0, 2, 4, 6, 1, 3, 5],   # multi-element change
+                [1, 2, 4, 6, 0, 3, 5],   # single-element change vs previous
+                [1, 2, 4, 6, 0, 5, 3],   # swap of last two
+            ]
+            for perm in perms:
+                seq.set_state(0, perm)
+                np.testing.assert_array_equal(
+                    ag_no.state(0), M_arr[perm[:-1], perm[1:]])
+                full = [3] + list(perm)
+                np.testing.assert_array_equal(
+                    ag_pre.state(0),
+                    np.array([M_arr[full[t], full[t + 1]] for t in range(7)]))
+
+    def test_dynamic_sequence_construction(self):
+        # Phase 2: dynamic sequences are now supported.
+        model = Model()
+        M = model.constant(np.arange(16).reshape(4, 4).astype(float))
+        s = model.set(4)
+        ag = dwave.optimization.symbols.AdjacentGather(M, s)
+        ag_pre = dwave.optimization.symbols.AdjacentGather(M, s, prepend=0)
+        self.assertEqual(ag.shape(), (-1,))
+        self.assertEqual(ag_pre.shape(), (-1,))
+
+    def test_dynamic_sequence_numpy_equivalence(self):
+        # Drive a Set through a sequence of states exercising pure-grow,
+        # pure-shrink, mutate-and-grow, and mutate-and-shrink. After each
+        # commit the cached values must agree with a full NumPy recomputation.
+        rng = np.random.default_rng(7)
+        n = 6
+        M_arr = rng.integers(-50, 50, size=(n, n)).astype(float)
+
+        for prepend in (None, 0, 3):
+            with self.subTest(prepend=prepend):
+                model = Model()
+                M = model.constant(M_arr)
+                s = model.set(n)
+                if prepend is None:
+                    ag = dwave.optimization.symbols.AdjacentGather(M, s)
+                else:
+                    ag = dwave.optimization.symbols.AdjacentGather(
+                        M, s, prepend=prepend)
+
+                self.assertEqual(ag.shape(), (-1,))
+
+                states = [
+                    [],
+                    [3],
+                    [3, 1],
+                    [3, 1, 4, 0, 5, 2],
+                    [0, 1, 2, 3, 4, 5],
+                    [0, 1, 2],
+                    [],
+                    [2, 5, 1, 0],
+                    [2, 5, 1, 0, 4],
+                    [4, 0, 1, 5, 2],
+                    [4, 0],
+                ]
+
+                with model.lock():
+                    model.states.resize(1)
+                    for st in states:
+                        s.set_state(0, st)
+                        out = ag.state(0)
+                        if prepend is None:
+                            if len(st) < 2:
+                                expected = np.empty(0, dtype=float)
+                            else:
+                                expected = M_arr[st[:-1], st[1:]]
+                        else:
+                            full = [prepend] + list(st)
+                            expected = np.array(
+                                [M_arr[full[t], full[t + 1]] for t in range(len(st))],
+                                dtype=float,
+                            )
+                        self.assertEqual(out.shape, expected.shape)
+                        np.testing.assert_array_equal(out, expected)
+
+    def test_dynamic_sequence_serialization(self):
+        model = Model()
+        M = model.constant(np.arange(25).reshape(5, 5).astype(float))
+        s = model.set(5)
+        dwave.optimization.symbols.AdjacentGather(M, s)
+        dwave.optimization.symbols.AdjacentGather(M, s, prepend=2)
+        with model.lock():
+            with model.to_file() as f:
+                copy = Model.from_file(f)
+        self.assertEqual(model.num_symbols(), copy.num_symbols())
+
+    def test_rectangular_matrix_accepted(self):
+        # Asymmetric / rectangular matrices are now allowed as long as both
+        # axes are large enough to cover every sequence value (axis 0 must
+        # also cover ``prepend``). This is required for directed-cost models
+        # like CVRPTW and asymmetric TSP.
+        model = Model()
+        M_arr = np.arange(20).reshape(4, 5).astype(float)  # 4 rows, 5 cols
+        M = model.constant(M_arr)
+        seq = model.list(4)  # values in [0, 4) -> fit in both axes
+        ag = dwave.optimization.symbols.AdjacentGather(M, seq)
+        self.assertEqual(ag.shape(), (3,))
+        with model.lock():
+            model.states.resize(1)
+            seq.set_state(0, [0, 3, 1, 2])
+            np.testing.assert_array_equal(
+                ag.state(0), M_arr[[0, 3, 1], [3, 1, 2]])
+
+    def test_invalid_matrix_axis_too_small(self):
+        # Even with the squareness requirement removed, both axes must still
+        # be large enough to index every possible sequence value.
+        model = Model()
+        # 4-row, 3-col matrix; seq can take value 3, which is out of range
+        # for the column axis.
+        M = model.constant(np.arange(12).reshape(4, 3).astype(float))
+        seq = model.list(4)
+        with self.assertRaisesRegex(ValueError, "second dimension"):
+            dwave.optimization.symbols.AdjacentGather(M, seq)
+
+    def test_invalid_non_2d_matrix(self):
+        model = Model()
+        M = model.constant(np.arange(8).reshape(2, 2, 2).astype(float))
+        seq = model.list(2)
+        with self.assertRaisesRegex(ValueError, "2-dimensional"):
+            dwave.optimization.symbols.AdjacentGather(M, seq)
+
+    def test_invalid_non_constant_matrix(self):
+        model = Model()
+        M = model.integer((4, 4), lower_bound=0, upper_bound=10)
+        seq = model.list(4)
+        with self.assertRaisesRegex(ValueError, "ConstantNode"):
+            dwave.optimization.symbols.AdjacentGather(M, seq)
+
+    def test_invalid_non_integral_sequence(self):
+        model = Model()
+        M = model.constant(np.arange(16).reshape(4, 4).astype(float))
+        seq = model.constant(np.array([0.5, 1.5, 2.5, 3.5]))
+        with self.assertRaisesRegex(ValueError, "integral"):
+            dwave.optimization.symbols.AdjacentGather(M, seq)
+
+    def test_invalid_prepend_out_of_range(self):
+        model = Model()
+        M = model.constant(np.arange(16).reshape(4, 4).astype(float))
+        seq = model.list(4)
+        with self.assertRaisesRegex(ValueError, "out of range"):
+            dwave.optimization.symbols.AdjacentGather(M, seq, prepend=99)
+        with self.assertRaisesRegex(ValueError, "out of range"):
+            dwave.optimization.symbols.AdjacentGather(M, seq, prepend=-1)
+
+    def test_invalid_non_integral_prepend(self):
+        model = Model()
+        M = model.constant(np.arange(16).reshape(4, 4).astype(float))
+        seq = model.list(4)
+        with self.assertRaisesRegex(TypeError, "integer"):
+            dwave.optimization.symbols.AdjacentGather(M, seq, prepend=1.5)
+
+    def test_no_prepend_length_one_sequence_yields_empty(self):
+        # The static "seq.size() >= 2 without prepend" rejection has been
+        # dropped: a length-0 output is legal (it produces an empty array).
+        model = Model()
+        M_arr = np.arange(16).reshape(4, 4).astype(float)
+        M = model.constant(M_arr)
+        seq = model.list(1)  # only permitted value is [0]
+        ag = dwave.optimization.symbols.AdjacentGather(M, seq)
+        self.assertEqual(ag.shape(), (0,))
+        with model.lock():
+            model.states.resize(1)
+            seq.set_state(0, [0])
+            self.assertEqual(ag.state(0).shape, (0,))
+
+
+class TestAdjacentGatherSum(utils.SymbolTests):
+    def generate_symbols(self):
+        model = Model()
+        M = model.constant(np.arange(16).reshape(4, 4).astype(float))
+        seq_a = model.list(4)
+        seq_b = model.list(4)
+        total_no_prepend = dwave.optimization.symbols.AdjacentGatherSum(M, seq_a)
+        total_with_prepend = dwave.optimization.symbols.AdjacentGatherSum(
+            M, seq_b, prepend=0)
+        with model.lock():
+            yield total_no_prepend
+            yield total_with_prepend
+
+    def test_matches_adjacent_gather_sum(self):
+        rng = np.random.default_rng(11)
+        M_arr = rng.integers(-100, 100, size=(6, 6)).astype(float)
+        model = Model()
+        M = model.constant(M_arr)
+        seq = model.list(6)
+        fused = dwave.optimization.symbols.AdjacentGatherSum(M, seq)
+        vector = dwave.optimization.symbols.AdjacentGather(M, seq).sum()
+
+        with model.lock():
+            model.states.resize(1)
+            for perm in ([0, 1, 2, 3, 4, 5], [5, 0, 4, 1, 3, 2], [3, 2, 1, 0, 5, 4]):
+                seq.set_state(0, perm)
+                self.assertEqual(float(fused.state(0)), float(vector.state(0)))
+
+    def test_dynamic_sequence_matches_adjacent_gather_sum(self):
+        rng = np.random.default_rng(12)
+        M_arr = rng.integers(-50, 50, size=(6, 6)).astype(float)
+        states = [[], [3], [3, 1], [3, 1, 4, 0, 5, 2], [0, 1, 2], [], [4, 0]]
+
+        for prepend in (None, 0, 3):
+            with self.subTest(prepend=prepend):
+                model = Model()
+                M = model.constant(M_arr)
+                seq = model.set(6)
+                fused = dwave.optimization.symbols.AdjacentGatherSum(
+                    M, seq, prepend=prepend)
+                vector = dwave.optimization.symbols.AdjacentGather(
+                    M, seq, prepend=prepend).sum()
+                with model.lock():
+                    model.states.resize(1)
+                    for state in states:
+                        seq.set_state(0, state)
+                        self.assertEqual(float(fused.state(0)), float(vector.state(0)))
+
+    def test_serialization(self):
+        model = Model()
+        M = model.constant(np.arange(25).reshape(5, 5).astype(float))
+        seq = model.set(5)
+        dwave.optimization.symbols.AdjacentGatherSum(M, seq)
+        dwave.optimization.symbols.AdjacentGatherSum(M, seq, prepend=2)
+        with model.lock():
+            with model.to_file() as f:
+                copy = Model.from_file(f)
+        self.assertEqual(model.num_symbols(), copy.num_symbols())
+
+    def test_invalid_non_integral_prepend(self):
+        model = Model()
+        M = model.constant(np.arange(16).reshape(4, 4).astype(float))
+        seq = model.list(4)
+        with self.assertRaisesRegex(TypeError, "integer"):
+            dwave.optimization.symbols.AdjacentGatherSum(M, seq, prepend=1.5)
+
+
 class TestAdd(utils.BinaryOpTests):
     def generate_symbols(self):
         model = Model()

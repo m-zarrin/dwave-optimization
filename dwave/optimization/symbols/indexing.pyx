@@ -27,6 +27,8 @@ from dwave.optimization.libcpp cimport dynamic_cast_ptr, get, holds_alternative
 from dwave.optimization.libcpp.array cimport Slice
 from dwave.optimization.libcpp.graph cimport ArrayNode, Node
 from dwave.optimization.libcpp.nodes.indexing cimport (
+    AdjacentGatherNode,
+    AdjacentGatherSumNode,
     AdvancedIndexingNode,
     BasicIndexingNode,
     PermutationNode,
@@ -325,3 +327,161 @@ cdef class Permutation(ArraySymbol):
         self.initialize_arraynode(array.model, ptr)
 
 _register(Permutation, typeid(PermutationNode))
+
+
+cdef class AdjacentGather(ArraySymbol):
+    """Gather pairwise lookups along consecutive elements of a 1-D integer
+    sequence indexed into a 2-D matrix.
+
+    Equivalent to NumPy's ``matrix[seq[:-1], seq[1:]]`` (without ``prepend``)
+    or, with ``prepend``, ``[matrix[prepend, seq[0]], matrix[seq[0], seq[1]],
+    ...]``.
+
+    * ``matrix`` must be a :class:`.Constant` (immutable values).
+    * ``matrix`` must be 2-D. Rectangular matrices are accepted when both axes
+      cover the value range of ``sequence``.
+    * ``sequence`` must be a 1-D integral symbol. Fixed-size and dynamic
+      sequences are both supported.
+    * ``prepend``, if provided, is an integer value in range for the matrix's
+      first axis.
+
+    Examples:
+        >>> import numpy as np
+        >>> from dwave.optimization import Model
+        >>> from dwave.optimization.symbols import AdjacentGather
+        >>> model = Model()
+        >>> M = model.constant(np.arange(16).reshape(4, 4).astype(float))
+        >>> seq = model.list(4)
+        >>> edges = AdjacentGather(M, seq)               # length 3
+        >>> edges_with_depot = AdjacentGather(M, seq, 0) # length 4
+
+    See Also:
+        :class:`.Permutation`, :class:`.AdvancedIndexing`
+    """
+    def __init__(self, ArraySymbol matrix, ArraySymbol sequence, prepend=None):
+        if matrix.model is not sequence.model:
+            raise ValueError("matrix and sequence do not share the same underlying model")
+
+        cdef _Graph model = matrix.model
+        cdef AdjacentGatherNode* ptr
+        if prepend is None:
+            ptr = model._graph.emplace_node[AdjacentGatherNode](
+                matrix.array_ptr, sequence.array_ptr)
+        else:
+            if not isinstance(prepend, numbers.Integral):
+                raise TypeError("prepend must be an integer")
+            ptr = model._graph.emplace_node[AdjacentGatherNode](
+                matrix.array_ptr, sequence.array_ptr, <Py_ssize_t>(prepend))
+        self.ptr = ptr
+        self.initialize_arraynode(model, ptr)
+
+    @classmethod
+    def _from_symbol(cls, Symbol symbol):
+        cdef AdjacentGatherNode* ptr = dynamic_cast_ptr[AdjacentGatherNode](symbol.node_ptr)
+        if not ptr:
+            raise TypeError(f"given symbol cannot construct a {cls.__name__}")
+        cdef AdjacentGather sym = AdjacentGather.__new__(AdjacentGather)
+        sym.ptr = ptr
+        sym.initialize_arraynode(symbol.model, ptr)
+        return sym
+
+    @classmethod
+    def _from_zipfile(cls, zf, directory, _Graph model, predecessors):
+        if len(predecessors) != 2:
+            raise ValueError("AdjacentGather should have exactly two predecessors")
+        with zf.open(directory + "prepend.json", "r") as f:
+            payload = json.load(f)
+        prepend = payload.get("prepend", None)
+        return cls(predecessors[0], predecessors[1], prepend=prepend)
+
+    def _into_zipfile(self, zf, directory):
+        super()._into_zipfile(zf, directory)
+        encoder = json.JSONEncoder(separators=(',', ':'))
+        payload = {"prepend": self.ptr.prepend()} if self.ptr.has_prepend() else {}
+        zf.writestr(directory + "prepend.json", encoder.encode(payload))
+
+    def maybe_equals(self, other):
+        cdef Py_ssize_t NOT = 0
+        cdef Py_ssize_t MAYBE = 1
+        equality = super().maybe_equals(other)
+        if equality != MAYBE:
+            return equality
+        if not isinstance(other, AdjacentGather):
+            return NOT
+        if self.ptr.has_prepend() != (<AdjacentGather>other).ptr.has_prepend():
+            return NOT
+        if self.ptr.has_prepend() and self.ptr.prepend() != (<AdjacentGather>other).ptr.prepend():
+            return NOT
+        return MAYBE
+
+    cdef AdjacentGatherNode* ptr
+
+_register(AdjacentGather, typeid(AdjacentGatherNode))
+
+
+cdef class AdjacentGatherSum(ArraySymbol):
+    """Scalar sum of pairwise lookups along consecutive sequence elements.
+
+    This is the fused scalar counterpart to :class:`.AdjacentGather`. It has
+    the same input restrictions, but returns the total transition cost directly
+    instead of materializing the 1-D edge-cost array.
+    """
+    def __init__(self, ArraySymbol matrix, ArraySymbol sequence, prepend=None):
+        if matrix.model is not sequence.model:
+            raise ValueError("matrix and sequence do not share the same underlying model")
+
+        cdef _Graph model = matrix.model
+        cdef AdjacentGatherSumNode* ptr
+        if prepend is None:
+            ptr = model._graph.emplace_node[AdjacentGatherSumNode](
+                matrix.array_ptr, sequence.array_ptr)
+        else:
+            if not isinstance(prepend, numbers.Integral):
+                raise TypeError("prepend must be an integer")
+            ptr = model._graph.emplace_node[AdjacentGatherSumNode](
+                matrix.array_ptr, sequence.array_ptr, <Py_ssize_t>(prepend))
+        self.ptr = ptr
+        self.initialize_arraynode(model, ptr)
+
+    @classmethod
+    def _from_symbol(cls, Symbol symbol):
+        cdef AdjacentGatherSumNode* ptr = dynamic_cast_ptr[AdjacentGatherSumNode](symbol.node_ptr)
+        if not ptr:
+            raise TypeError(f"given symbol cannot construct a {cls.__name__}")
+        cdef AdjacentGatherSum sym = AdjacentGatherSum.__new__(AdjacentGatherSum)
+        sym.ptr = ptr
+        sym.initialize_arraynode(symbol.model, ptr)
+        return sym
+
+    @classmethod
+    def _from_zipfile(cls, zf, directory, _Graph model, predecessors):
+        if len(predecessors) != 2:
+            raise ValueError("AdjacentGatherSum should have exactly two predecessors")
+        with zf.open(directory + "prepend.json", "r") as f:
+            payload = json.load(f)
+        prepend = payload.get("prepend", None)
+        return cls(predecessors[0], predecessors[1], prepend=prepend)
+
+    def _into_zipfile(self, zf, directory):
+        super()._into_zipfile(zf, directory)
+        encoder = json.JSONEncoder(separators=(',', ':'))
+        payload = {"prepend": self.ptr.prepend()} if self.ptr.has_prepend() else {}
+        zf.writestr(directory + "prepend.json", encoder.encode(payload))
+
+    def maybe_equals(self, other):
+        cdef Py_ssize_t NOT = 0
+        cdef Py_ssize_t MAYBE = 1
+        equality = super().maybe_equals(other)
+        if equality != MAYBE:
+            return equality
+        if not isinstance(other, AdjacentGatherSum):
+            return NOT
+        if self.ptr.has_prepend() != (<AdjacentGatherSum>other).ptr.has_prepend():
+            return NOT
+        if self.ptr.has_prepend() and self.ptr.prepend() != (<AdjacentGatherSum>other).ptr.prepend():
+            return NOT
+        return MAYBE
+
+    cdef AdjacentGatherSumNode* ptr
+
+_register(AdjacentGatherSum, typeid(AdjacentGatherSumNode))
